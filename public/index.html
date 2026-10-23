@@ -35,17 +35,32 @@
 
   <nav class="tabs" role="tablist">
     <button type="button" role="tab" id="tabChat" aria-controls="chatPane" aria-selected="true">대화</button>
+    <button type="button" role="tab" id="tabPast" aria-controls="pastPane" aria-selected="false">지난 기록</button>
     <button type="button" role="tab" id="tabMemo" aria-controls="memoPane" aria-selected="false">바탕화면 메모</button>
   </nav>
 
   <section class="pane chat" id="chatPane" role="tabpanel" aria-labelledby="tabChat">
     <ol id="log" class="log" aria-live="polite"></ol>
     <p id="err" class="err" role="alert" hidden></p>
+    <p id="toast" class="toast" role="status" hidden></p>
     <form id="compose" class="compose">
       <label class="sr" for="text">답장</label>
       <textarea id="text" rows="1" placeholder="답장 입력" enterkeyhint="enter"></textarea>
       <button id="send" type="submit">보내기</button>
     </form>
+  </section>
+
+  <section class="pane past" id="pastPane" role="tabpanel" aria-labelledby="tabPast" hidden>
+    <div id="pastDays" class="past-days">
+      <ol id="dayList" class="day-list"></ol>
+    </div>
+    <div id="pastDay" class="past-day" hidden>
+      <div class="past-head">
+        <button type="button" id="pastBack" class="past-back">← 날짜 목록</button>
+        <h2 id="pastTitle" class="past-title"></h2>
+      </div>
+      <ol id="pastLog" class="log"></ol>
+    </div>
   </section>
 
   <section class="pane memo" id="memoPane" role="tabpanel" aria-labelledby="tabMemo" hidden>
@@ -77,6 +92,21 @@
     </form>
   </section>
 </main>
+
+<div class="sheet" id="clearSheet" hidden>
+  <div class="sheet-box" role="dialog" aria-modal="true" aria-labelledby="clearTitle">
+    <h2 id="clearTitle">지우기</h2>
+    <button type="button" id="clearView" class="sheet-btn">
+      <strong>교실 화면 비우기</strong>
+      <span>교실 컴퓨터 화면에서만 사라집니다. 기록은 남아 지난 기록에서 볼 수 있습니다.</span>
+    </button>
+    <button type="button" id="clearAll" class="sheet-btn is-danger">
+      <strong>기록 모두 삭제</strong>
+      <span>서버에 남은 대화와 사진을 모두 지웁니다. 되돌릴 수 없습니다.</span>
+    </button>
+    <button type="button" id="clearCancel" class="sheet-cancel">취소</button>
+  </div>
+</div>
 
 <div class="viewer" id="viewer" hidden>
   <img id="viewerImg" alt="캡처 크게 보기">

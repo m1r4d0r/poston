@@ -9,15 +9,24 @@
 //   m/<13자리 밀리초>-<보낸 쪽>-<임의 4자>  메시지 하나. 사전순이 곧 시간순이라 동시에 보내도 덮어쓰지 않는다.
 //   img/<메시지 키에서 m/를 뗀 부분>          메시지에 붙은 사진(JPEG)
 //   presence/class                         교실 프로그램이 마지막으로 연락한 시각(밀리초)
-//   meta/epoch                             마지막으로 대화를 지운 시각. 바뀌면 화면이 목록을 새로 받는다.
+//   meta/epoch                             마지막으로 대화를 모두 지운 시각(밀리초)
+//   meta/cleared                           마지막으로 교실 화면을 비운 시각(밀리초). 메시지는 남는다.
 //   memo                                   바탕화면 메모 { text, align, size, visible, updatedAt }
+//
+// 교실 화면에는 "오늘(한국 시간) 0시"와 "화면을 비운 시각" 중 늦은 때 이후 메시지만 내준다.
+// 교실이 받는 epoch는 그 시작 시각과 모두 지운 시각 중 큰 값이라, 자정이나 화면 비우기 때도 바뀌어
+// 프로그램이 목록을 새로 받는다. 지난 메시지는 ?days, ?day 로 날짜별로 꺼내 본다.
+// 메시지는 KEEP_DAYS 일이 지나면 서버에서 지운다.
 //
 // 요청
 //   GET    ?since=&epoch=&ping=1   새 메시지 + 메모 (+ 폰에는 교실 접속 시각)
 //   GET    ?img=<메시지 키>          사진 원본
+//   GET    ?days=1                  기록이 있는 날짜 목록 { days: [{ date: "YYYY-MM-DD", count }] } 최근 날짜부터
+//   GET    ?day=YYYY-MM-DD          그날(한국 시간) 메시지 모두 { date, messages }
 //   POST   { text, image }          메시지 보내기. image는 JPEG data URL
 //   POST   { memo: {...} }          메모 고치기 (양쪽 모두)
-//   DELETE                         대화 모두 지우기 (폰만)
+//   POST   { clear: true }          교실 화면 비우기. 기록은 남는다 (양쪽 모두)
+//   DELETE                         대화 기록 모두 지우기 (폰만)
 
 import { getStore } from "@netlify/blobs";
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -25,7 +34,10 @@ import { createHash, timingSafeEqual } from "node:crypto";
 const MAX_TEXT = 2000;
 const MAX_MEMO = 2000;
 const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
-const KEEP = 300;
+const RECENT = 300;
+const KEEP_DAYS = 365;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const KST_MS = 9 * 60 * 60 * 1000;
 const ALIGNS = ["left", "center", "right"];
 const DEFAULT_MEMO = { text: "", align: "left", size: 28, visible: true, updatedAt: 0 };
 
@@ -58,10 +70,39 @@ function newKey(from) {
 }
 
 const imageKey = (id) => "img/" + id.slice(2);
+const keyAt = (ms) => "m/" + String(ms).padStart(13, "0");
+const timeOfKey = (k) => Number(k.slice(2, 15));
+const kstDayStart = (ms) => Math.floor((ms + KST_MS) / DAY_MS) * DAY_MS - KST_MS;
+const kstDate = (ms) => new Date(ms + KST_MS).toISOString().slice(0, 10);
 
 async function messageKeys(store) {
   const { blobs } = await store.list({ prefix: "m/" });
   return blobs.map((b) => b.key).sort();
+}
+
+// 키의 13자리 시각 중 앞 5자리가 같으면 약 28시간 안에 쓰인 메시지다.
+// 그 묶음 단위로 필요한 구간만 훑어서, 기록이 쌓여도 4초마다 오는 확인 요청이 가볍게 한다.
+const BUCKET = 1e8;
+async function keysBetween(store, fromMs, toMs) {
+  const prefixes = [];
+  for (let b = Math.floor(fromMs / BUCKET); b <= Math.floor(toMs / BUCKET); b++) {
+    prefixes.push("m/" + String(b).padStart(5, "0"));
+  }
+  const lists = await Promise.all(prefixes.map((prefix) => store.list({ prefix })));
+  const lo = keyAt(fromMs);
+  return lists
+    .flatMap((l) => l.blobs.map((b) => b.key))
+    .filter((k) => k >= lo)
+    .sort();
+}
+
+// 서버마다 시계가 조금씩 달라도 방금 쓰인 메시지를 놓치지 않도록 끝을 넉넉히 잡는다.
+const keysSince = (store, fromMs) => keysBetween(store, fromMs, Date.now() + 60_000);
+
+async function classView(store) {
+  const [deleted, cleared] = await Promise.all([store.get("meta/epoch"), store.get("meta/cleared")]);
+  const start = Math.max(Number(cleared) || 0, kstDayStart(Date.now()));
+  return { start, epoch: String(Math.max(Number(deleted) || 0, start)) };
 }
 
 async function readMessages(store, keys) {
@@ -127,13 +168,25 @@ async function handleGet(req, role, store) {
     });
   }
 
-  const epoch = (await store.get("meta/epoch")) || "0";
+  if (params.get("days")) return json(200, { days: await dayList(store) });
+  const day = params.get("day");
+  if (day !== null) return dayMessages(store, day);
+
+  const view = role === "class" ? await classView(store) : null;
+  const epoch = view ? view.epoch : (await store.get("meta/epoch")) || "0";
   const clientEpoch = params.get("epoch");
   const reset = clientEpoch !== null && clientEpoch !== epoch;
   const since = reset ? "" : params.get("since") || "";
 
-  const all = await messageKeys(store);
-  const wanted = since ? all.filter((k) => k > since) : all.slice(-KEEP);
+  let wanted;
+  if (view) {
+    wanted = (await keysSince(store, view.start)).filter((k) => k > since);
+  } else if (/^m\/\d{13}-/.test(since)) {
+    wanted = (await keysSince(store, timeOfKey(since))).filter((k) => k > since);
+  } else {
+    const all = await messageKeys(store);
+    wanted = since ? all.filter((k) => k > since) : all.slice(-RECENT);
+  }
   const [messages, memo] = await Promise.all([readMessages(store, wanted), readMemo(store)]);
 
   const out = { role, epoch, reset, messages, memo };
@@ -144,6 +197,31 @@ async function handleGet(req, role, store) {
     out.classSeen = Number((await store.get("presence/class")) || 0);
   }
   return json(200, out);
+}
+
+async function dayList(store) {
+  const counts = new Map();
+  for (const k of await messageKeys(store)) {
+    const date = kstDate(timeOfKey(k));
+    counts.set(date, (counts.get(date) || 0) + 1);
+  }
+  return [...counts].map(([date, count]) => ({ date, count })).reverse();
+}
+
+async function dayMessages(store, date) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!m) return json(400, { error: "bad-day" });
+  const start = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) - KST_MS;
+  if (kstDate(start) !== date) return json(400, { error: "bad-day" });
+  const end = keyAt(start + DAY_MS);
+  const keys = (await keysBetween(store, start, start + DAY_MS - 1)).filter((k) => k < end);
+  return json(200, { date, messages: await readMessages(store, keys) });
+}
+
+async function clearClassView(store) {
+  await store.set("meta/cleared", String(Date.now()));
+  const { epoch } = await classView(store);
+  return json(200, { ok: true, epoch });
 }
 
 async function saveMemo(store, input) {
@@ -179,6 +257,7 @@ async function handlePost(req, role, store) {
     return json(400, { error: "bad-json" });
   }
   if (body && typeof body.memo === "object" && body.memo !== null) return saveMemo(store, body.memo);
+  if (body?.clear === true) return clearClassView(store);
 
   const text = typeof body?.text === "string" ? body.text.replace(/\r\n/g, "\n").trim() : "";
   let jpeg = null;
@@ -198,8 +277,9 @@ async function handlePost(req, role, store) {
   }
   await store.setJSON(id, message);
 
-  const keys = await messageKeys(store);
-  if (keys.length > KEEP) await deleteMessages(store, keys.slice(0, keys.length - KEEP));
+  const expired = keyAt(Date.now() - KEEP_DAYS * DAY_MS);
+  const old = (await messageKeys(store)).filter((k) => k < expired);
+  if (old.length) await deleteMessages(store, old);
 
   let notified = false;
   if (role === "class") {

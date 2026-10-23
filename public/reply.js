@@ -22,6 +22,8 @@
     memo: null,
     memoDraft: null,
     memoDirty: false,
+    pastSeq: 0,
+    toastTimer: 0,
   };
 
   function readKey() {
@@ -80,17 +82,17 @@
   });
 
   /* 탭 */
+  const TABS = { chat: ['tabChat', 'chatPane'], past: ['tabPast', 'pastPane'], memo: ['tabMemo', 'memoPane'] };
   function selectTab(name) {
-    const chat = name === 'chat';
-    $('tabChat').setAttribute('aria-selected', String(chat));
-    $('tabMemo').setAttribute('aria-selected', String(!chat));
-    $('chatPane').hidden = !chat;
-    $('memoPane').hidden = chat;
-    $('clear').hidden = !chat;
-    if (chat) $('log').scrollTop = $('log').scrollHeight;
+    for (const [key, [tab, pane]] of Object.entries(TABS)) {
+      $(tab).setAttribute('aria-selected', String(key === name));
+      $(pane).hidden = key !== name;
+    }
+    $('clear').hidden = name !== 'chat';
+    if (name === 'chat') $('log').scrollTop = $('log').scrollHeight;
+    if (name === 'past') showDays();
   }
-  $('tabChat').addEventListener('click', () => selectTab('chat'));
-  $('tabMemo').addEventListener('click', () => selectTab('memo'));
+  for (const [key, [tab]] of Object.entries(TABS)) $(tab).addEventListener('click', () => selectTab(key));
 
   /* 대화방 */
   function enterRoom() {
@@ -166,17 +168,10 @@
     return btn;
   }
 
-  function appendMessage(m) {
-    const log = $('log');
-    const day = dayKey(m.at);
-    if (day !== state.lastDay) {
-      log.append(el('li', 'day', dayLabel(m.at)));
-      state.lastDay = day;
-      state.lastFrom = '';
-    }
+  function messageItem(m, showName) {
     const mine = m.from === ME;
     const li = el('li', `msg ${mine ? 'mine' : 'theirs'}`);
-    if (!mine && state.lastFrom !== m.from) li.append(el('div', 'name', THEM_NAME));
+    if (!mine && showName) li.append(el('div', 'name', THEM_NAME));
     const row = el('div', 'row');
     const bubble = el('div', 'bubble');
     if (m.image) bubble.append(photoButton(m.id));
@@ -186,7 +181,18 @@
     time.dateTime = m.at;
     row.append(bubble, time);
     li.append(row);
-    log.append(li);
+    return li;
+  }
+
+  function appendMessage(m) {
+    const log = $('log');
+    const day = dayKey(m.at);
+    if (day !== state.lastDay) {
+      log.append(el('li', 'day', dayLabel(m.at)));
+      state.lastDay = day;
+      state.lastFrom = '';
+    }
+    log.append(messageItem(m, state.lastFrom !== m.from));
     state.lastFrom = m.from;
   }
 
@@ -223,6 +229,59 @@
     $('err').textContent = msg;
     $('err').hidden = !msg;
   }
+
+  function toast(msg) {
+    clearTimeout(state.toastTimer);
+    $('toast').textContent = msg;
+    $('toast').hidden = false;
+    state.toastTimer = setTimeout(() => { $('toast').hidden = true; }, 5000);
+  }
+
+  /* 지난 기록 — 날짜를 고르면 그날 대화를 연다 */
+  const dateLabel = (date) => dayLabel(date + 'T12:00:00+09:00');
+
+  async function showDays() {
+    const seq = ++state.pastSeq;
+    $('pastDay').hidden = true;
+    $('pastDays').hidden = false;
+    const list = $('dayList');
+    list.replaceChildren(el('li', 'note', '불러오는 중'));
+    const r = await api('GET', { query: { days: 1 } });
+    if (seq !== state.pastSeq) return;
+    if (!r.ok) { list.replaceChildren(el('li', 'note', '기록을 불러오지 못했습니다.')); return; }
+    const days = r.data.days || [];
+    if (!days.length) { list.replaceChildren(el('li', 'note', '남아 있는 기록이 없습니다.')); return; }
+    list.replaceChildren(...days.map(({ date, count }) => {
+      const btn = el('button');
+      btn.type = 'button';
+      btn.append(el('span', '', dateLabel(date)), el('span', 'count', `${count}개`));
+      btn.addEventListener('click', () => showDay(date));
+      const li = el('li');
+      li.append(btn);
+      return li;
+    }));
+  }
+
+  async function showDay(date) {
+    const seq = ++state.pastSeq;
+    $('pastDays').hidden = true;
+    $('pastDay').hidden = false;
+    $('pastTitle').textContent = dateLabel(date);
+    const log = $('pastLog');
+    log.replaceChildren(el('li', 'empty', '불러오는 중'));
+    const r = await api('GET', { query: { day: date } });
+    if (seq !== state.pastSeq) return;
+    if (!r.ok) { log.replaceChildren(el('li', 'empty', '기록을 불러오지 못했습니다.')); return; }
+    let lastFrom = '';
+    const items = (r.data.messages || []).map((m) => {
+      const li = messageItem(m, lastFrom !== m.from);
+      lastFrom = m.from;
+      return li;
+    });
+    log.replaceChildren(...(items.length ? items : [el('li', 'empty', '이날 남은 기록이 없습니다.')]));
+    log.scrollTop = 0;
+  }
+  $('pastBack').addEventListener('click', showDays);
 
   /* 사진 크게 보기 */
   function openViewer(src) {
@@ -383,17 +442,35 @@
     }
   });
 
-  /* 지우기 · 나가기 */
-  $('clear').addEventListener('click', async () => {
-    if (!confirm('대화를 모두 지울까요? 교실 컴퓨터 화면에서도 사라집니다.')) return;
+  /* 지우기 — 교실 화면만 비우거나, 기록까지 모두 지운다 */
+  const sheet = $('clearSheet');
+  const closeSheet = () => { sheet.hidden = true; };
+  $('clear').addEventListener('click', () => { sheet.hidden = false; });
+  $('clearCancel').addEventListener('click', closeSheet);
+  sheet.addEventListener('click', (e) => { if (e.target === sheet) closeSheet(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !sheet.hidden) closeSheet(); });
+
+  $('clearView').addEventListener('click', async () => {
+    closeSheet();
+    const r = await api('POST', { body: { clear: true } });
+    if (r.ok) toast('교실 화면을 비웠습니다. 기록은 지난 기록에 남아 있습니다.');
+    else showErr('교실 화면을 비우지 못했습니다.');
+  });
+
+  $('clearAll').addEventListener('click', async () => {
+    if (!confirm('서버에 남은 대화와 사진을 모두 지울까요? 되돌릴 수 없습니다.')) return;
+    closeSheet();
     const r = await api('DELETE');
     if (r.ok) {
       state.epoch = r.data.epoch;
       resetLog();
+      toast('기록을 모두 지웠습니다.');
     } else {
       showErr('지우지 못했습니다.');
     }
   });
+
+  /* 나가기 */
 
   $('leave').addEventListener('click', () => {
     if (!confirm('이 폰에서 로그아웃할까요?')) return;
